@@ -384,12 +384,12 @@ class NiimbotDevice:
             self._printer._heartbeat_payload = self._heartbeat_payload
         return self._printer
 
-    async def _release_printer(self) -> None:
+    async def _release_printer(self, *, force: bool = False) -> None:
         """Stop notify / disconnect unless keep_connection holds the session open."""
         if self._printer is not None and self._printer.heartbeat_payload is not None:
             self._heartbeat_payload = self._printer.heartbeat_payload
 
-        if self.keep_connection and self.is_connected:
+        if not force and self.keep_connection and self.is_connected:
             return
 
         if self._printer is not None:
@@ -397,14 +397,17 @@ class NiimbotDevice:
                 await self._printer.stop_notify()
             except Exception:
                 pass
-            self._printer = None
+            finally:
+                self._printer = None
 
         if self.client is not None:
             try:
                 await self.client.disconnect()
             except Exception:
                 pass
-            self._notify_connection()
+            finally:
+                self.client = None
+                self._notify_connection()
 
     @property
     def is_connected(self) -> bool:
@@ -431,19 +434,7 @@ class NiimbotDevice:
 
     async def disconnect(self):
         """Disconnect from the BLE device if connected."""
-        if self._printer is not None:
-            try:
-                await self._printer.stop_notify()
-            except Exception:
-                pass
-            finally:
-                self._printer = None
-        if self.client and self.client.is_connected:
-            try:
-                await self.client.disconnect()
-            except Exception:
-                pass
-            self._notify_connection()
+        await self._release_printer(force=True)
 
     async def refresh_info(self, ble_device: BLEDevice) -> BLEData:
         """Force-refresh cached PrinterInfo settings."""
@@ -658,6 +649,7 @@ class NiimbotDevice:
                 await self._maybe_read_ribbon_rfid(printer)
             except PrinterTimeout as err:
                 _LOGGER.warning("Printer timed out during update: %s", err)
+                await self._release_printer(force=True)
                 raise
             finally:
                 await self._release_printer()
@@ -868,4 +860,3 @@ class NiimbotDevice:
             "duration": self.print_duration,
             "copies": copies,
         }
-
