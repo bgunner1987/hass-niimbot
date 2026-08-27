@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from custom_components import niimbot as integration
 from custom_components.niimbot.niimprint import parser
 from custom_components.niimbot.niimprint.parser import NiimbotDevice
 from custom_components.niimbot.niimprint.printer import PrinterTimeout
@@ -80,5 +81,24 @@ def test_disconnect_clears_state_when_cleanup_fails():
         client.disconnect.assert_awaited_once()
         assert device._printer is None
         assert device.client is None
+
+    run(_test())
+
+
+def test_timeout_recovery_clears_connector_cache(monkeypatch):
+    async def _test():
+        device = MagicMock()
+        device.disconnect = AsyncMock()
+        close_stale = AsyncMock()
+        monkeypatch.setattr(
+            integration, "close_stale_connections_by_address", close_stale
+        )
+
+        await integration._recover_stale_connection(
+            "AA:BB:CC:DD:EE:FF", device
+        )
+
+        device.disconnect.assert_awaited_once()
+        close_stale.assert_awaited_once_with("AA:BB:CC:DD:EE:FF")
 
     run(_test())

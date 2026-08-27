@@ -39,7 +39,7 @@ from .const import (
     EMPTY_PNG,
     ImageAndBLEData,
 )
-from .niimprint import BLEData, NiimbotDevice, PrinterError
+from .niimprint import BLEData, NiimbotDevice, PrinterError, PrinterTimeout
 from .niimprint.model import get_supported_label_type_codes
 from .render import render_image
 
@@ -53,6 +53,12 @@ PLATFORMS: list[Platform] = [
 ]
 
 _LOGGER = logging.getLogger(__name__)
+
+
+async def _recover_stale_connection(address: str, device: NiimbotDevice) -> None:
+    """Clear both local and connector-level state after a printer timeout."""
+    await device.disconnect()
+    await close_stale_connections_by_address(address)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -212,6 +218,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         try:
             data = await niimbot.update_device(ble_device)
+        except PrinterTimeout as err:
+            _LOGGER.warning(
+                "Printer timed out for %s: %s; clearing stale BLE connection",
+                address,
+                err,
+            )
+            await _recover_stale_connection(address, niimbot)
+            data = niimbot.ble_data
         except Exception as err:
             _LOGGER.warning("Unable to fetch data from %s: %s; returning last known data", address, err)
             data = niimbot.ble_data
