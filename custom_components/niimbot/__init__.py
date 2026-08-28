@@ -3,7 +3,9 @@
 import base64
 import io
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from time import monotonic
 
 from bleak_retry_connector import close_stale_connections_by_address
 from homeassistant.components import bluetooth
@@ -54,11 +56,136 @@ PLATFORMS: list[Platform] = [
 
 _LOGGER = logging.getLogger(__name__)
 
+_MISSING_BLE_RECOVERY_COOLDOWN = 15 * 60
+_MISSING_BLE_ACTIVE_SCAN_DURATION = 5.0
+
+
+@dataclass
+class _MissingBLERecoveryState:
+    """Track bounded recovery attempts for one configured printer."""
+
+    last_attempt: float | None = None
+    missing: bool = False
+
+    def reset(self) -> None:
+        """Reset recovery state after the device becomes available."""
+        self.last_attempt = None
+        self.missing = False
+
 
 async def _recover_stale_connection(address: str, device: NiimbotDevice) -> None:
     """Clear both local and connector-level state after a printer timeout."""
     await device.disconnect()
     await close_stale_connections_by_address(address)
+
+
+async def _recover_missing_ble_device(
+    hass: HomeAssistant, address: str, device: NiimbotDevice
+):
+    """Run one bounded recovery attempt for a missing HA BLE device."""
+    _LOGGER.debug("Starting stale connection cleanup for %s", address)
+    try:
+        await device.disconnect()
+    except Exception as err:
+        _LOGGER.debug("Local BLE cleanup failed for %s: %s", address, err)
+
+    try:
+        await close_stale_connections_by_address(address)
+    except Exception as err:
+        _LOGGER.debug("Connector BLE cleanup failed for %s: %s", address, err)
+
+    clear_history = getattr(
+        bluetooth, "async_clear_advertisement_history", None
+    )
+    if clear_history is not None:
+        try:
+            clear_history(hass, address)
+            _LOGGER.debug("Advertisement history cleared for %s", address)
+        except Exception as err:
+            _LOGGER.debug(
+                "Unable to clear advertisement history for %s: %s", address, err
+            )
+
+    try:
+        bluetooth.async_rediscover_address(hass, address)
+        _LOGGER.debug("Rediscovery requested for %s", address)
+    except Exception as err:
+        _LOGGER.debug("Unable to request rediscovery for %s: %s", address, err)
+
+    ble_device = bluetooth.async_ble_device_from_address(hass, address)
+    if ble_device is not None:
+        return ble_device
+
+    request_active_scan = getattr(bluetooth, "async_request_active_scan", None)
+    if request_active_scan is not None:
+        try:
+            await request_active_scan(hass, _MISSING_BLE_ACTIVE_SCAN_DURATION)
+            _LOGGER.debug("Active scan completed for %s", address)
+        except Exception as err:
+            _LOGGER.debug("Active scan failed for %s: %s", address, err)
+
+    return bluetooth.async_ble_device_from_address(hass, address)
+
+
+async def _async_update_niimbot(
+    hass: HomeAssistant,
+    address: str,
+    device: NiimbotDevice,
+    recovery_state: _MissingBLERecoveryState,
+) -> BLEData:
+    """Update a printer, recovering when HA has lost its BLE device."""
+    ble_device = bluetooth.async_ble_device_from_address(hass, address)
+    if ble_device is None:
+        now = monotonic()
+        if (
+            recovery_state.last_attempt is not None
+            and now - recovery_state.last_attempt < _MISSING_BLE_RECOVERY_COOLDOWN
+        ):
+            _LOGGER.debug(
+                "BLE device missing for %s; recovery skipped because cooldown is active",
+                address,
+            )
+            return device.ble_data
+
+        if not recovery_state.missing:
+            _LOGGER.warning(
+                "BLE device not available for address %s; attempting recovery",
+                address,
+            )
+        else:
+            _LOGGER.debug("BLE device still missing for %s; retrying recovery", address)
+
+        recovery_state.missing = True
+        recovery_state.last_attempt = now
+        ble_device = await _recover_missing_ble_device(hass, address, device)
+        if ble_device is None:
+            _LOGGER.debug(
+                "BLE device still unavailable for %s after recovery", address
+            )
+            return device.ble_data
+
+        _LOGGER.debug("BLE device found for %s after recovery", address)
+
+    if recovery_state.missing:
+        _LOGGER.debug("BLE device available again for %s", address)
+    recovery_state.reset()
+
+    try:
+        return await device.update_device(ble_device)
+    except PrinterTimeout as err:
+        _LOGGER.warning(
+            "Printer timed out for %s: %s; clearing stale BLE connection",
+            address,
+            err,
+        )
+        await _recover_stale_connection(address, device)
+    except Exception as err:
+        _LOGGER.warning(
+            "Unable to fetch data from %s: %s; returning last known data",
+            address,
+            err,
+        )
+    return device.ble_data
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -120,7 +247,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     ble_device = bluetooth.async_ble_device_from_address(hass, address)
     if not ble_device:
-        _LOGGER.warning(
+        _LOGGER.debug(
             "Could not find Niimbot device with address %s during setup; continuing without initial data",
             address,
         )
@@ -130,6 +257,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         keep_connection=keep_connection,
         connection_sound_seed=connection_sound_seed,
     )
+    recovery_state = _MissingBLERecoveryState()
 
     async def _refresh_cloud_label_info(barcode: str) -> None:
         """Resolve a label barcode via the cloud catalogue and push the result.
@@ -211,24 +339,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     async def _async_update_method() -> BLEData:
         """Get data from Niimbot BLE."""
-        ble_device = bluetooth.async_ble_device_from_address(hass, address)
-        if ble_device is None:
-            _LOGGER.warning("BLE device not available for address %s; returning last known data", address)
-            return niimbot.ble_data
-
         try:
-            data = await niimbot.update_device(ble_device)
-        except PrinterTimeout as err:
-            _LOGGER.warning(
-                "Printer timed out for %s: %s; clearing stale BLE connection",
-                address,
-                err,
+            data = await _async_update_niimbot(
+                hass, address, niimbot, recovery_state
             )
-            await _recover_stale_connection(address, niimbot)
-            data = niimbot.ble_data
-        except Exception as err:
-            _LOGGER.warning("Unable to fetch data from %s: %s; returning last known data", address, err)
-            data = niimbot.ble_data
         finally:
             # Fire roll-change events even when the rest of the poll failed
             # after RFID data was already applied.
