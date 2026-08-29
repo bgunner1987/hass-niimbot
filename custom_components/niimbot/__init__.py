@@ -66,9 +66,12 @@ class _MissingBLERecoveryState:
 
     last_attempt: float | None = None
     missing: bool = False
+    ble_recovery_count: int = 0
+    last_ble_recovery: datetime | None = None
+    last_ble_recovery_result: str | None = None
 
     def reset(self) -> None:
-        """Reset recovery state after the device becomes available."""
+        """Reset cooldown state after the device becomes available."""
         self.last_attempt = None
         self.missing = False
 
@@ -80,7 +83,10 @@ async def _recover_stale_connection(address: str, device: NiimbotDevice) -> None
 
 
 async def _recover_missing_ble_device(
-    hass: HomeAssistant, address: str, device: NiimbotDevice
+    hass: HomeAssistant,
+    address: str,
+    device: NiimbotDevice,
+    recovery_state: _MissingBLERecoveryState | None = None,
 ):
     """Run one bounded recovery attempt for a missing HA BLE device."""
     _LOGGER.debug("Starting stale connection cleanup for %s", address)
@@ -122,6 +128,8 @@ async def _recover_missing_ble_device(
             await request_active_scan(hass, _MISSING_BLE_ACTIVE_SCAN_DURATION)
             _LOGGER.debug("Active scan completed for %s", address)
         except Exception as err:
+            if recovery_state is not None:
+                recovery_state.last_ble_recovery_result = "scan_failed"
             _LOGGER.debug("Active scan failed for %s: %s", address, err)
 
     return bluetooth.async_ble_device_from_address(hass, address)
@@ -148,7 +156,7 @@ async def _async_update_niimbot(
             return device.ble_data
 
         if not recovery_state.missing:
-            _LOGGER.warning(
+            _LOGGER.debug(
                 "BLE device not available for address %s; attempting recovery",
                 address,
             )
@@ -157,13 +165,21 @@ async def _async_update_niimbot(
 
         recovery_state.missing = True
         recovery_state.last_attempt = now
-        ble_device = await _recover_missing_ble_device(hass, address, device)
+        recovery_state.ble_recovery_count += 1
+        recovery_state.last_ble_recovery = datetime.now(timezone.utc)
+        recovery_state.last_ble_recovery_result = None
+        ble_device = await _recover_missing_ble_device(
+            hass, address, device, recovery_state
+        )
         if ble_device is None:
+            if recovery_state.last_ble_recovery_result is None:
+                recovery_state.last_ble_recovery_result = "still_unavailable"
             _LOGGER.debug(
                 "BLE device still unavailable for %s after recovery", address
             )
             return device.ble_data
 
+        recovery_state.last_ble_recovery_result = "success"
         _LOGGER.debug("BLE device found for %s after recovery", address)
 
     if recovery_state.missing:
@@ -178,6 +194,9 @@ async def _async_update_niimbot(
             address,
             err,
         )
+        recovery_state.ble_recovery_count += 1
+        recovery_state.last_ble_recovery = datetime.now(timezone.utc)
+        recovery_state.last_ble_recovery_result = "timeout_cleanup"
         await _recover_stale_connection(address, device)
     except Exception as err:
         _LOGGER.warning(
